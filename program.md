@@ -1,114 +1,158 @@
-# autoresearch
+# automl-autoresearch
 
-This is an experiment to have the LLM do its own research.
+This repo is now a minimal closed loop for **agentic AutoML** on an mle-bench style competition.
+
+The current default competition is `tabular-playground-series-may-2022`.
 
 ## Setup
 
-To set up a new experiment, work with the user to:
+To start a new experiment run, work with the human to:
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `README.md` — repository context.
-   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
-   - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+1. **Agree on a run tag**: use a fresh branch like `automl/<tag>`.
+2. **Create the branch**: `git checkout -b automl/<tag>` from the current main branch.
+3. **Read the in-scope files**:
+   - `prepare.py` - fixed infrastructure: dataset discovery/prep, grading helpers, leaderboard comparison.
+   - `train.py` - the only ML file you modify.
+   - `analysis.ipynb` - experiment analysis and progress plot.
+   - `tabular-playground-series-may-2022/prepared/description.md` - task statement.
+4. **Prepare the competition assets**: run `python prepare.py`.
+   - This should verify that `./tabular-playground-series-may-2022/prepared/` is usable.
+   - If only a local zip/raw dataset exists, `prepare.py` will materialize the mle-bench style `public/` and `private/` splits when possible.
+5. **Initialize `results.tsv`**: `prepare.py` creates it if needed.
+6. **Confirm and go**: after the dataset is ready, start experimentation.
 
-Once you get confirmation, kick off the experimentation.
+Important: use `python`, not `uv run`, for this AutoML loop unless you have separately installed `scikit-learn` inside the uv environment.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+Each experiment should keep the repo structure simple:
 
-**What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+- `prepare.py` is fixed infrastructure. Do not edit it during the experiment loop.
+- `analysis.ipynb` is for post-hoc analysis. Do not edit it during the loop.
+- `train.py` is the only ML script you edit.
 
-**What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+The job of `train.py` is:
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+- load the mle-bench style competition data
+- run a local AutoML search / model selection procedure
+- generate a valid `submission.csv`
+- report both:
+  - `public_score`: the local public proxy score (OOF / CV on public train)
+  - `private_score`: the offline hidden score against `private/gold_submission.csv`
+- compare the private score to the historical leaderboard and print the medal bucket
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
+The key metric is **`private_score`**, and for this competition **higher is better** because the metric is ROC AUC.
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
+## First Run
 
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+The first run should always be the baseline with the default `train.py`:
 
-## Output format
-
-Once the script finishes it prints a summary like this:
-
+```bash
+python train.py > run.log 2>&1
 ```
+
+Then inspect the summary:
+
+```bash
+rg "^(public_score|private_score|medal|train_seconds):" run.log
+```
+
+## Output Format
+
+A successful run prints a summary block like:
+
+```text
 ---
-val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     45060.2
-mfu_percent:      39.80
-total_tokens_M:   499.6
-num_steps:        953
-num_params_M:     50.3
-depth:            8
+competition_id:    tabular-playground-series-may-2022
+feature_version:   v1
+public_score:      0.987654
+private_score:     0.988765
+medal:             silver
+estimated_rank:    123
+train_seconds:     92.4
+selected_models:   hgb_wide, logreg_l2
+submission_path:   ...
+run_summary_path:  ...
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+If `private_score` is missing, assume the run crashed or produced an invalid submission.
 
+## Logging Results
+
+Log every experiment to `results.tsv` as tab-separated values with this header:
+
+```text
+commit	private_score	public_score	train_seconds	medal	status	description
 ```
-grep "^val_bpb:" run.log
-```
 
-## Logging results
-
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
-
-The TSV has a header row and 5 columns:
-
-```
-commit	val_bpb	memory_gb	status	description
-```
+Field meanings:
 
 1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+2. private score achieved, use `0.000000` for crashes
+3. public proxy score achieved, use `0.000000` for crashes
+4. training seconds, use `0.0` for crashes
+5. medal bucket: `gold`, `silver`, `bronze`, `none`, or `unavailable`
+6. status: `keep`, `discard`, or `crash`
+7. short experiment description
 
 Example:
 
+```text
+commit	private_score	public_score	train_seconds	medal	status	description
+abc1234	0.987650	0.986900	94.2	silver	keep	baseline blend of two HGB models and logistic regression
+bcd2345	0.988110	0.987050	101.7	silver	keep	add extra string interaction features
+cde3456	0.987100	0.986500	88.4	none	discard	reduce search rows for faster iterations
 ```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
+
+Do not commit `results.tsv`.
+
+## Experiment Loop
+
+Loop autonomously after setup:
+
+1. Check the current branch and commit.
+2. Modify `train.py` with one clear AutoML idea.
+3. Commit the change.
+4. Run the experiment:
+
+```bash
+python train.py > run.log 2>&1
 ```
 
-## The experiment loop
+5. Read out the results:
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+```bash
+rg "^(public_score|private_score|medal|train_seconds):" run.log
+```
 
-LOOP FOREVER:
+6. If the summary block is missing, inspect the failure:
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+```bash
+tail -n 80 run.log
+```
+
+7. Append the result to `results.tsv`.
+8. If `private_score` improved, keep the commit and continue from there.
+9. If `private_score` is equal or worse, reset back to the previous best commit.
+
+## Research Guidance
+
+Good `train.py` ideas include:
+
+- improving tabular feature engineering
+- changing candidate model families or hyperparameters
+- altering search budget, folds, or blend logic
+- smarter ensembling and calibration
+- simplifying the pipeline while keeping or improving `private_score`
+
+Keep the code readable. Small, clean improvements beat large messy changes with no clear gain.
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+*Timeout*: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
 
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+*Crashes*: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
+*NEVER STOP*: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working indefinitely until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
 
 As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!

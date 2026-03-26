@@ -1,389 +1,484 @@
-"""
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+from __future__ import annotations
 
-Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
-
-Data and tokenizer are stored in ~/.cache/autoresearch/.
-"""
-
-import os
-import sys
-import time
-import math
 import argparse
-import pickle
-from multiprocessing import Pool
+import json
+import shutil
+import zipfile
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
-import torch
+import numpy as np
+import pandas as pd
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
 
-# ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
-# ---------------------------------------------------------------------------
-
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
-
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
-
-# ---------------------------------------------------------------------------
-# Data download
-# ---------------------------------------------------------------------------
-
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+ROOT_DIR = Path(__file__).resolve().parent
+DEFAULT_COMPETITION_ID = "tabular-playground-series-may-2022"
+TIME_BUDGET_SECONDS = 300
+RANDOM_SEED = 42
+RESULTS_PATH = ROOT_DIR / "results.tsv"
+RESULTS_HEADER = "commit\tprivate_score\tpublic_score\ttrain_seconds\tmedal\tstatus\tdescription\n"
+REQUIRED_PUBLIC_FILES = ("train.csv", "test.csv", "sample_submission.csv")
+REQUIRED_PRIVATE_FILES = ("gold_submission.csv",)
+SUPPORTED_RAW_PREPARERS = {DEFAULT_COMPETITION_ID}
+METADATA_FILENAMES = (
+    "checksums.yaml",
+    "config.yaml",
+    "description.md",
+    "description_obfuscated.md",
+    "grade.py",
+    "leaderboard.csv",
+    "prepare.py",
+    "utils.py",
+)
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+class InvalidSubmissionError(Exception):
+    """Raised when a submission cannot be graded."""
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+@dataclass(frozen=True)
+class CompetitionPaths:
+    competition_id: str
+    competition_dir: Path
+    raw_dir: Path
+    public_dir: Path
+    private_dir: Path
+    train_path: Path
+    public_test_path: Path
+    sample_submission_path: Path
+    gold_submission_path: Path
+    private_test_path: Path
+    description_path: Path
+    leaderboard_path: Path
+    config_path: Path
+    artifacts_dir: Path
+    submissions_dir: Path
+    runs_dir: Path
+
+    @property
+    def prepared_dir(self) -> Path:
+        return self.competition_dir / "prepared"
 
 
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+@dataclass(frozen=True)
+class DatasetSummary:
+    competition_id: str
+    train_rows: int
+    public_test_rows: int
+    private_rows: int
+    num_features: int
+    target_mean: float
+    description_path: str
+    leaderboard_path: str | None
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
 
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+@dataclass(frozen=True)
+class ScoreReport:
+    score: float
+    medal: str
+    above_median: bool | None
+    estimated_rank: int | None
+    total_teams: int | None
+    gold_threshold: float | None
+    silver_threshold: float | None
+    bronze_threshold: float | None
+    median_threshold: float | None
+    lower_is_better: bool | None
 
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
 
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
+def get_metadata_source_dir(competition_id: str) -> Path | None:
+    candidates = [
+        ROOT_DIR / competition_id / "prepared",
+        ROOT_DIR / "mle-bench" / "mlebench" / "competitions" / competition_id,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
 
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
+def resolve_metadata_path(competition_id: str, filename: str) -> Path:
+    local_path = ROOT_DIR / competition_id / "prepared" / filename
+    if local_path.exists():
+        return local_path
+    source_dir = get_metadata_source_dir(competition_id)
+    if source_dir is not None:
+        return source_dir / filename
+    return local_path
+
+
+def get_competition_paths(competition_id: str = DEFAULT_COMPETITION_ID) -> CompetitionPaths:
+    competition_dir = ROOT_DIR / competition_id
+    public_dir = competition_dir / "prepared" / "public"
+    private_dir = competition_dir / "prepared" / "private"
+    artifacts_dir = ROOT_DIR / "artifacts" / competition_id
+    submissions_dir = artifacts_dir / "submissions"
+    runs_dir = artifacts_dir / "runs"
+    return CompetitionPaths(
+        competition_id=competition_id,
+        competition_dir=competition_dir,
+        raw_dir=competition_dir / "raw",
+        public_dir=public_dir,
+        private_dir=private_dir,
+        train_path=public_dir / "train.csv",
+        public_test_path=public_dir / "test.csv",
+        sample_submission_path=public_dir / "sample_submission.csv",
+        gold_submission_path=private_dir / "gold_submission.csv",
+        private_test_path=private_dir / "test.csv",
+        description_path=resolve_metadata_path(competition_id, "description.md"),
+        leaderboard_path=resolve_metadata_path(competition_id, "leaderboard.csv"),
+        config_path=resolve_metadata_path(competition_id, "config.yaml"),
+        artifacts_dir=artifacts_dir,
+        submissions_dir=submissions_dir,
+        runs_dir=runs_dir,
     )
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
 
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
-
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
-
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
-
-# ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
-# ---------------------------------------------------------------------------
-
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
+def initialize_results_tsv(results_path: Path = RESULTS_PATH) -> Path:
+    if not results_path.exists():
+        results_path.write_text(RESULTS_HEADER, encoding="utf-8")
+    return results_path
 
 
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+def copy_metadata_files(paths: CompetitionPaths) -> None:
+    source_dir = get_metadata_source_dir(paths.competition_id)
+    if source_dir is None:
+        return
+    paths.prepared_dir.mkdir(parents=True, exist_ok=True)
+    for filename in METADATA_FILENAMES:
+        src = source_dir / filename
+        dst = paths.prepared_dir / filename
+        if src.exists() and not dst.exists():
+            shutil.copy2(src, dst)
 
 
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
+def find_first_file(root: Path, filename: str) -> Path:
+    direct = root / filename
+    if direct.exists():
+        return direct
+    matches = sorted(root.rglob(filename))
+    if not matches:
+        raise FileNotFoundError(f"Could not find `{filename}` under `{root}`.")
+    return matches[0]
+
+
+def extract_zip_to_raw(zip_path: Path, raw_dir: Path) -> None:
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as zf:
+        zf.extractall(raw_dir)
+
+
+def prepare_tabular_playground_may_2022(raw_dir: Path, public_dir: Path, private_dir: Path) -> None:
+    train_csv = find_first_file(raw_dir, "train.csv")
+    old_train = pd.read_csv(train_csv)
+    new_train, new_test = train_test_split(old_train, test_size=100_000, random_state=0)
+
+    new_train = new_train.reset_index(drop=True)
+    new_test = new_test.reset_index(drop=True)
+    new_train["id"] = np.arange(len(new_train))
+    new_test["id"] = np.arange(len(new_train), len(new_train) + len(new_test))
+
+    new_test_without_labels = new_test.drop(columns=["target"]).copy()
+    gold_submission = new_test[["id", "target"]].copy()
+    sample_submission = gold_submission.copy()
+    sample_submission["target"] = 0.5
+
+    public_dir.mkdir(parents=True, exist_ok=True)
+    private_dir.mkdir(parents=True, exist_ok=True)
+    new_train.to_csv(public_dir / "train.csv", index=False)
+    new_test_without_labels.to_csv(public_dir / "test.csv", index=False)
+    sample_submission.to_csv(public_dir / "sample_submission.csv", index=False)
+    new_test.to_csv(private_dir / "test.csv", index=False)
+    gold_submission.to_csv(private_dir / "gold_submission.csv", index=False)
+
+
+def is_prepared(paths: CompetitionPaths) -> bool:
+    for filename in REQUIRED_PUBLIC_FILES:
+        if not (paths.public_dir / filename).exists():
+            return False
+    for filename in REQUIRED_PRIVATE_FILES:
+        if not (paths.private_dir / filename).exists():
+            return False
+    return True
+
+
+def prepare_from_local_sources(paths: CompetitionPaths, force: bool = False) -> None:
+    if force and paths.prepared_dir.exists():
+        shutil.rmtree(paths.prepared_dir)
+
+    if is_prepared(paths):
+        copy_metadata_files(paths)
+        return
+
+    zip_candidates = sorted(paths.competition_dir.glob("*.zip"))
+    if not paths.raw_dir.exists() or not any(paths.raw_dir.iterdir()):
+        if not zip_candidates:
+            raise FileNotFoundError(
+                f"No prepared dataset found for `{paths.competition_id}` and no local zip file is available. "
+                f"Expected either `{paths.prepared_dir}` or a zip inside `{paths.competition_dir}`."
+            )
+        extract_zip_to_raw(zip_candidates[0], paths.raw_dir)
+
+    if paths.competition_id not in SUPPORTED_RAW_PREPARERS:
+        raise NotImplementedError(
+            f"Automatic raw->prepared conversion is only implemented for {sorted(SUPPORTED_RAW_PREPARERS)}. "
+            f"For `{paths.competition_id}`, place an mle-bench style prepared dataset under `{paths.prepared_dir}` first."
+        )
+
+    prepare_tabular_playground_may_2022(paths.raw_dir, paths.public_dir, paths.private_dir)
+    copy_metadata_files(paths)
+
+
+def prepare_for_auroc_metric(
+    submission: pd.DataFrame,
+    answers: pd.DataFrame,
+    id_col: str = "id",
+    target_col: str = "target",
+) -> dict[str, np.ndarray]:
+    if id_col not in answers.columns or target_col not in answers.columns:
+        raise InvalidSubmissionError(f"Answers must contain `{id_col}` and `{target_col}` columns.")
+    if id_col not in submission.columns or target_col not in submission.columns:
+        raise InvalidSubmissionError(f"Submission must contain `{id_col}` and `{target_col}` columns.")
+    if len(submission) != len(answers):
+        raise InvalidSubmissionError("Submission and answers must have the same number of rows.")
+
+    y_score = pd.to_numeric(submission[target_col], errors="coerce")
+    if y_score.isna().any():
+        raise InvalidSubmissionError("Submission target column must be numeric.")
+    if (y_score < 0).any() or (y_score > 1).any():
+        raise InvalidSubmissionError("Submission target column must contain probabilities in [0, 1].")
+
+    submission_sorted = submission.sort_values(id_col).reset_index(drop=True)
+    answers_sorted = answers.sort_values(id_col).reset_index(drop=True)
+    if not submission_sorted[id_col].equals(answers_sorted[id_col]):
+        raise InvalidSubmissionError(f"Submission and answers must contain the same `{id_col}` values.")
+
+    return {
+        "y_true": answers_sorted[target_col].to_numpy(),
+        "y_score": submission_sorted[target_col].to_numpy(dtype=float),
+    }
+
+
+def grade_submission(submission: pd.DataFrame, answers: pd.DataFrame) -> float:
+    metric_inputs = prepare_for_auroc_metric(submission, answers)
+    return float(roc_auc_score(metric_inputs["y_true"], metric_inputs["y_score"]))
+
+
+def load_gold_answers(paths: CompetitionPaths) -> pd.DataFrame:
+    return pd.read_csv(paths.gold_submission_path)
+
+
+def read_public_data(paths: CompetitionPaths) -> tuple[pd.DataFrame, pd.DataFrame]:
+    train_df = pd.read_csv(paths.train_path)
+    test_df = pd.read_csv(paths.public_test_path)
+    return train_df, test_df
+
+
+def score_submission(submission: pd.DataFrame, paths: CompetitionPaths) -> ScoreReport:
+    score = grade_submission(submission, load_gold_answers(paths))
+    return compare_to_leaderboard(score, paths.leaderboard_path)
+
+
+def compare_to_leaderboard(score: float, leaderboard_path: Path) -> ScoreReport:
+    if not leaderboard_path.exists():
+        return ScoreReport(
+            score=score,
+            medal="unavailable",
+            above_median=None,
+            estimated_rank=None,
+            total_teams=None,
+            gold_threshold=None,
+            silver_threshold=None,
+            bronze_threshold=None,
+            median_threshold=None,
+            lower_is_better=None,
+        )
+
+    leaderboard = pd.read_csv(leaderboard_path)
+    if "score" not in leaderboard.columns or leaderboard.empty:
+        return ScoreReport(
+            score=score,
+            medal="unavailable",
+            above_median=None,
+            estimated_rank=None,
+            total_teams=None,
+            gold_threshold=None,
+            silver_threshold=None,
+            bronze_threshold=None,
+            median_threshold=None,
+            lower_is_better=None,
+        )
+
+    scores = leaderboard["score"].astype(float).reset_index(drop=True)
+    lower_is_better = bool(scores.iloc[0] < scores.iloc[-1])
+    num_teams = len(scores)
+
+    def score_at_position(position: int) -> float:
+        idx = min(max(position, 1), num_teams) - 1
+        return float(scores.iloc[idx])
+
+    if 1 <= num_teams < 100:
+        gold_threshold = score_at_position(max(1, int(num_teams * 0.1)))
+        silver_threshold = score_at_position(max(1, int(num_teams * 0.2)))
+        bronze_threshold = score_at_position(max(1, int(num_teams * 0.4)))
+    elif 100 <= num_teams < 250:
+        gold_threshold = score_at_position(10)
+        silver_threshold = score_at_position(max(1, int(num_teams * 0.2)))
+        bronze_threshold = score_at_position(max(1, int(num_teams * 0.4)))
+    elif 250 <= num_teams < 1000:
+        gold_threshold = score_at_position(10 + int(num_teams * 0.002))
+        silver_threshold = score_at_position(50)
+        bronze_threshold = score_at_position(100)
     else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
+        gold_threshold = score_at_position(10 + int(num_teams * 0.002))
+        silver_threshold = score_at_position(max(1, int(num_teams * 0.05)))
+        bronze_threshold = score_at_position(max(1, int(num_teams * 0.1)))
+
+    median_threshold = float(scores.median())
+
+    def meets(threshold: float) -> bool:
+        return score <= threshold if lower_is_better else score >= threshold
+
+    gold_medal = meets(gold_threshold)
+    silver_medal = not gold_medal and meets(silver_threshold)
+    bronze_medal = not gold_medal and not silver_medal and meets(bronze_threshold)
+    medal = "gold" if gold_medal else "silver" if silver_medal else "bronze" if bronze_medal else "none"
+    above_median = score < median_threshold if lower_is_better else score > median_threshold
+
+    if lower_is_better:
+        estimated_rank = int((scores < score).sum() + 1)
+    else:
+        estimated_rank = int((scores > score).sum() + 1)
+
+    return ScoreReport(
+        score=score,
+        medal=medal,
+        above_median=bool(above_median),
+        estimated_rank=estimated_rank,
+        total_teams=num_teams,
+        gold_threshold=gold_threshold,
+        silver_threshold=silver_threshold,
+        bronze_threshold=bronze_threshold,
+        median_threshold=median_threshold,
+        lower_is_better=lower_is_better,
+    )
 
 
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
-    """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
+def build_dataset_summary(paths: CompetitionPaths) -> DatasetSummary:
+    train_df = pd.read_csv(paths.train_path)
+    public_test_df = pd.read_csv(paths.public_test_path)
+    gold_df = pd.read_csv(paths.gold_submission_path)
+    return DatasetSummary(
+        competition_id=paths.competition_id,
+        train_rows=len(train_df),
+        public_test_rows=len(public_test_df),
+        private_rows=len(gold_df),
+        num_features=len(train_df.columns) - 2,
+        target_mean=float(train_df["target"].mean()),
+        description_path=str(paths.description_path) if paths.description_path.exists() else "",
+        leaderboard_path=str(paths.leaderboard_path) if paths.leaderboard_path.exists() else None,
+    )
 
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+def validate_prepared_dataset(paths: CompetitionPaths) -> DatasetSummary:
+    missing = []
+    for filename in REQUIRED_PUBLIC_FILES:
+        path = paths.public_dir / filename
+        if not path.exists():
+            missing.append(str(path))
+    for filename in REQUIRED_PRIVATE_FILES:
+        path = paths.private_dir / filename
+        if not path.exists():
+            missing.append(str(path))
+    if missing:
+        raise FileNotFoundError("Missing required prepared files:\n" + "\n".join(missing))
 
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
+    train_df = pd.read_csv(paths.train_path)
+    public_test_df = pd.read_csv(paths.public_test_path)
+    sample_df = pd.read_csv(paths.sample_submission_path)
+    gold_df = pd.read_csv(paths.gold_submission_path)
 
-                remaining = row_capacity - pos
+    if "target" not in train_df.columns:
+        raise ValueError("Expected `target` column in prepared public train.csv.")
+    if "target" in public_test_df.columns:
+        raise ValueError("Public test.csv should not contain the target column.")
+    if list(sample_df.columns) != ["id", "target"]:
+        raise ValueError("sample_submission.csv must have columns [id, target].")
+    if list(gold_df.columns) != ["id", "target"]:
+        raise ValueError("gold_submission.csv must have columns [id, target].")
+    if len(public_test_df) != len(sample_df) or len(sample_df) != len(gold_df):
+        raise ValueError("Public test, sample submission, and gold submission must have identical row counts.")
+    if not sample_df["id"].equals(gold_df["id"]):
+        raise ValueError("sample_submission ids must match gold_submission ids exactly.")
 
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
+    if paths.private_test_path.exists():
+        private_test_df = pd.read_csv(paths.private_test_path)
+        if len(private_test_df) != len(gold_df):
+            raise ValueError("Private labeled test.csv must align with gold_submission.csv.")
+        if "target" not in private_test_df.columns:
+            raise ValueError("Private test.csv should retain labels for offline grading.")
 
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
+    return build_dataset_summary(paths)
 
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
 
-# ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
-# ---------------------------------------------------------------------------
+def write_context_file(paths: CompetitionPaths, summary: DatasetSummary) -> Path:
+    paths.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    context = {
+        "competition_id": paths.competition_id,
+        "time_budget_seconds": TIME_BUDGET_SECONDS,
+        "results_path": str(initialize_results_tsv()),
+        "summary": asdict(summary),
+    }
+    if paths.description_path.exists():
+        context["description_excerpt"] = paths.description_path.read_text(encoding="utf-8")[:2000]
+    context_path = paths.artifacts_dir / "competition_context.json"
+    context_path.write_text(json.dumps(context, indent=2), encoding="utf-8")
+    return context_path
 
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
-    """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
-    """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def ensure_prepared_competition(
+    competition_id: str = DEFAULT_COMPETITION_ID,
+    force: bool = False,
+) -> CompetitionPaths:
+    paths = get_competition_paths(competition_id)
+    prepare_from_local_sources(paths, force=force)
+    summary = validate_prepared_dataset(paths)
+    initialize_results_tsv()
+    write_context_file(paths, summary)
+    paths.submissions_dir.mkdir(parents=True, exist_ok=True)
+    paths.runs_dir.mkdir(parents=True, exist_ok=True)
+    return paths
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Prepare an mle-bench style competition for AutoML autoresearch.")
+    parser.add_argument("--competition-id", default=DEFAULT_COMPETITION_ID, help="Competition id / local folder name.")
+    parser.add_argument("--force", action="store_true", help="Rebuild the local prepared directory from raw/zip when possible.")
     args = parser.parse_args()
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
+    paths = ensure_prepared_competition(args.competition_id, force=args.force)
+    summary = build_dataset_summary(paths)
+    leaderboard = compare_to_leaderboard(summary.target_mean, paths.leaderboard_path)
 
-    print(f"Cache directory: {CACHE_DIR}")
+    print(f"Competition:      {summary.competition_id}")
+    print(f"Prepared dir:     {paths.prepared_dir}")
+    print(f"Train rows:       {summary.train_rows:,}")
+    print(f"Public test rows: {summary.public_test_rows:,}")
+    print(f"Private rows:     {summary.private_rows:,}")
+    print(f"Num features:     {summary.num_features}")
+    print(f"Target mean:      {summary.target_mean:.6f}")
+    if paths.description_path.exists():
+        print(f"Description:      {paths.description_path}")
+    if paths.leaderboard_path.exists():
+        print(f"Leaderboard:      {paths.leaderboard_path}")
+        print(f"Median score:     {leaderboard.median_threshold:.5f}")
+        print(f"Gold threshold:   {leaderboard.gold_threshold:.5f}")
+    print(f"Results TSV:      {initialize_results_tsv()}")
+    print(f"Time budget:      {TIME_BUDGET_SECONDS}s")
     print()
+    print("Ready. Use `python train.py` for experiments.")
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
 
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+if __name__ == "__main__":
+    main()
