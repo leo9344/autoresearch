@@ -6,30 +6,37 @@ The current default competition is `tabular-playground-series-may-2022`.
 
 ## Setup
 
-To start a new experiment run, work with the human to:
+To start a new experiment run, work with the user to:
 
 1. **Agree on a run tag**: use a fresh branch like `automl/<tag>`.
 2. **Create the branch**: `git checkout -b automl/<tag>` from the current main branch.
 3. **Read the in-scope files**:
+   - `README.md` - repository context.
    - `prepare.py` - fixed infrastructure: dataset discovery/prep, grading helpers, leaderboard comparison.
    - `train.py` - the only ML file you modify.
    - `analysis.ipynb` - experiment analysis and progress plot.
    - `tabular-playground-series-may-2022/prepared/description.md` - task statement.
-4. **Prepare the competition assets**: run `python prepare.py`.
+4. **Prepare the competition assets**: run `uv run python prepare.py`.
    - This should verify that `./tabular-playground-series-may-2022/prepared/` is usable.
    - If only a local zip/raw dataset exists, `prepare.py` will materialize the mle-bench style `public/` and `private/` splits when possible.
 5. **Initialize `results.tsv`**: `prepare.py` creates it if needed.
-6. **Confirm and go**: after the dataset is ready, start experimentation.
+6. **Confirm and go**: after the dataset is ready, Confirm setup looks good.
 
-Important: use `python`, not `uv run`, for this AutoML loop unless you have separately installed `scikit-learn` inside the uv environment.
+Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment should keep the repo structure simple:
+Each experiment runs on a CPU-only machine. You launch it simply as: `uv run train.py`.
 
-- `prepare.py` is fixed infrastructure. Do not edit it during the experiment loop.
-- `analysis.ipynb` is for post-hoc analysis. Do not edit it during the loop.
-- `train.py` is the only ML script you edit.
+What you CAN do:
+
+- Modify `train.py` — this is the only file you edit. Everything is fair game: data cleaning, feature engineering, model architecture, hyperparameters, ensembling, etc.
+
+What you CANNOT do:
+
+- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants.
+- Install new packages or add dependencies. You can only use what's already in pyproject.toml.
+- Modify the evaluation harness. The `grade_submission` function in `prepare.py` is the ground truth metric.
 
 The job of `train.py` is:
 
@@ -41,14 +48,16 @@ The job of `train.py` is:
   - `private_score`: the offline hidden score against `private/gold_submission.csv`
 - compare the private score to the historical leaderboard and print the medal bucket
 
-The key metric is **`private_score`**, and for this competition **higher is better** because the metric is ROC AUC.
+**The goal is simple: get the highest `private_score` **, and for this competition **higher is better** because the metric is ROC AUC.
+
+**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude.
 
 ## First Run
 
-The first run should always be the baseline with the default `train.py`:
+The first run: Your very first run should always be to establish the baseline, so you will run the training script as is.
 
 ```bash
-python train.py > run.log 2>&1
+uv run python train.py > run.log 2>&1
 ```
 
 Then inspect the summary:
@@ -116,7 +125,7 @@ Loop autonomously after setup:
 4. Run the experiment:
 
 ```bash
-python train.py > run.log 2>&1
+uv run python train.py > run.log 2>&1
 ```
 
 5. Read out the results:
