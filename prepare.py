@@ -3,481 +3,551 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
-import zipfile
-from dataclasses import asdict, dataclass
+import webbrowser
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+from typing import Any, Callable
 
-import numpy as np
-import pandas as pd
-from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import train_test_split
-
-ROOT_DIR = Path(__file__).resolve().parent
-DEFAULT_COMPETITION_ID = "tabular-playground-series-may-2022"
-TIME_BUDGET_SECONDS = 300
-RANDOM_SEED = 42
-RESULTS_PATH = ROOT_DIR / "results.tsv"
-RESULTS_HEADER = "commit\tprivate_score\tpublic_score\ttrain_seconds\tmedal\tstatus\tdescription\n"
-REQUIRED_PUBLIC_FILES = ("train.csv", "test.csv", "sample_submission.csv")
-REQUIRED_PRIVATE_FILES = ("gold_submission.csv",)
-SUPPORTED_RAW_PREPARERS = {DEFAULT_COMPETITION_ID}
-METADATA_FILENAMES = (
-    "checksums.yaml",
-    "config.yaml",
-    "description.md",
-    "description_obfuscated.md",
-    "grade.py",
-    "leaderboard.csv",
-    "prepare.py",
-    "utils.py",
+from mlebench.grade_helpers import Grader, InvalidSubmissionError
+from mlebench.utils import (
+    authenticate_kaggle_api,
+    extract,
+    get_logger,
+    import_fn,
+    is_empty,
+    load_answers,
+    load_yaml,
+    read_csv,
 )
 
+logger = get_logger(__name__)
 
-class InvalidSubmissionError(Exception):
-    """Raised when a submission cannot be graded."""
+REPO_ROOT = Path(__file__).resolve().parent
+COMPETITIONS_DIR = REPO_ROOT / "mlebench" / "competitions"
 
 
 @dataclass(frozen=True)
-class CompetitionPaths:
+class CompetitionContext:
     competition_id: str
-    competition_dir: Path
+    source_dir: Path
+    output_root: Path
     raw_dir: Path
     public_dir: Path
     private_dir: Path
-    train_path: Path
-    public_test_path: Path
+    description_source: Path
+    prepare_fn: Callable[[Path, Path, Path], object]
+    grader: Grader
+    answers_path: Path
     sample_submission_path: Path
     gold_submission_path: Path
-    private_test_path: Path
-    description_path: Path
     leaderboard_path: Path
-    config_path: Path
-    artifacts_dir: Path
-    submissions_dir: Path
-    runs_dir: Path
-
-    @property
-    def prepared_dir(self) -> Path:
-        return self.competition_dir / "prepared"
+    expected_output_files: dict[str, Path]
 
 
 @dataclass(frozen=True)
-class DatasetSummary:
+class GradeResult:
     competition_id: str
-    train_rows: int
-    public_test_rows: int
-    private_rows: int
-    num_features: int
-    target_mean: float
-    description_path: str
-    leaderboard_path: str | None
-
-
-@dataclass(frozen=True)
-class ScoreReport:
-    score: float
-    medal: str
-    above_median: bool | None
-    estimated_rank: int | None
-    total_teams: int | None
+    metric_name: str
+    score: float | None
+    submission_path: str
+    submission_exists: bool
+    valid_submission: bool
+    error_message: str | None
+    is_lower_better: bool | None
     gold_threshold: float | None
     silver_threshold: float | None
     bronze_threshold: float | None
     median_threshold: float | None
-    lower_is_better: bool | None
+    any_medal: bool
+    gold_medal: bool
+    silver_medal: bool
+    bronze_medal: bool
+    above_median: bool
+    answers_path: str
+    leaderboard_path: str | None
+    created_at: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "competition_id": self.competition_id,
+            "metric_name": self.metric_name,
+            "score": self.score,
+            "submission_path": self.submission_path,
+            "submission_exists": self.submission_exists,
+            "valid_submission": self.valid_submission,
+            "error_message": self.error_message,
+            "is_lower_better": self.is_lower_better,
+            "gold_threshold": self.gold_threshold,
+            "silver_threshold": self.silver_threshold,
+            "bronze_threshold": self.bronze_threshold,
+            "median_threshold": self.median_threshold,
+            "any_medal": self.any_medal,
+            "gold_medal": self.gold_medal,
+            "silver_medal": self.silver_medal,
+            "bronze_medal": self.bronze_medal,
+            "above_median": self.above_median,
+            "answers_path": self.answers_path,
+            "leaderboard_path": self.leaderboard_path,
+            "created_at": self.created_at,
+        }
 
 
-def get_metadata_source_dir(competition_id: str) -> Path | None:
-    candidates = [
-        ROOT_DIR / competition_id / "prepared",
-        ROOT_DIR / "mle-bench" / "mlebench" / "competitions" / competition_id,
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
+def list_competition_ids() -> list[str]:
+    return sorted(config.parent.name for config in COMPETITIONS_DIR.glob("*/config.yaml"))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Download and prepare a single MLE-bench competition dataset."
+    )
+    parser.add_argument(
+        "-c",
+        "--competition-name",
+        required=True,
+        help="Competition ID, for example `tabular-playground-series-may-2022`.",
+    )
+    parser.add_argument(
+        "-p",
+        "--path",
+        type=Path,
+        default=None,
+        help=(
+            "Output root directory. Defaults to "
+            "`./mlebench/competitions/<competition-name>`."
+        ),
+    )
+    parser.add_argument(
+        "--zip-file",
+        type=Path,
+        default=None,
+        help="Use an existing Kaggle zip instead of downloading it.",
+    )
+    parser.add_argument(
+        "--skip-download",
+        action="store_true",
+        help="Do not hit Kaggle. Requires an existing zip file or a populated `raw/` directory.",
+    )
+    parser.add_argument(
+        "--keep-raw",
+        action="store_true",
+        help="Keep the extracted `raw/` directory after preparation finishes.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Rebuild `prepared/` even if it already exists.",
+    )
+    parser.add_argument(
+        "--submission",
+        type=Path,
+        default=None,
+        help="Optional submission CSV to grade after the dataset is ready.",
+    )
+    return parser.parse_args()
+
+
+def strip_competition_prefix(competition_id: str, relative_path: str) -> Path:
+    path = Path(relative_path)
+    if path.parts and path.parts[0] == competition_id:
+        return Path(*path.parts[1:])
+    return path
+
+
+def resolve_output_root(competition_id: str, output_root: str | Path | None) -> Path:
+    if output_root is None:
+        return (COMPETITIONS_DIR / competition_id).resolve()
+    return Path(output_root).expanduser().resolve()
+
+
+def resolve_metadata_path(output_root: Path, source_dir: Path, filename: str) -> Path:
+    destination_path = (output_root / filename).resolve()
+    if destination_path.exists() or output_root == source_dir:
+        return destination_path
+    return (source_dir / filename).resolve()
+
+
+def build_context(competition_id: str, output_root: Path) -> CompetitionContext:
+    output_root = output_root.resolve()
+    source_dir = COMPETITIONS_DIR / competition_id
+    config_path = source_dir / "config.yaml"
+
+    if not config_path.is_file():
+        valid_ids = ", ".join(list_competition_ids())
+        raise FileNotFoundError(
+            f"Unknown competition `{competition_id}`. Valid options: {valid_ids}"
+        )
+
+    config = load_yaml(config_path)
+    prepare_fn = import_fn(config["preparer"])
+    grader = Grader.from_dict(config["grader"])
+    description_source = REPO_ROOT / config["description"]
+    dataset_paths = {
+        key: output_root / strip_competition_prefix(competition_id, relative_path)
+        for key, relative_path in config["dataset"].items()
+    }
+    expected_output_files = dict(dataset_paths)
+
+    return CompetitionContext(
+        competition_id=competition_id,
+        source_dir=source_dir,
+        output_root=output_root,
+        raw_dir=(output_root / "raw").resolve(),
+        public_dir=(output_root / "prepared" / "public").resolve(),
+        private_dir=(output_root / "prepared" / "private").resolve(),
+        description_source=description_source.resolve(),
+        prepare_fn=prepare_fn,
+        grader=grader,
+        answers_path=dataset_paths["answers"].resolve(),
+        sample_submission_path=dataset_paths["sample_submission"].resolve(),
+        gold_submission_path=dataset_paths.get("gold_submission", dataset_paths["answers"]).resolve(),
+        leaderboard_path=resolve_metadata_path(output_root, source_dir, "leaderboard.csv"),
+        expected_output_files=expected_output_files,
+    )
+
+
+def ensure_dirs(context: CompetitionContext) -> None:
+    context.output_root.mkdir(parents=True, exist_ok=True)
+    context.raw_dir.mkdir(parents=True, exist_ok=True)
+    context.public_dir.mkdir(parents=True, exist_ok=True)
+    context.private_dir.mkdir(parents=True, exist_ok=True)
+
+
+def sync_competition_metadata(context: CompetitionContext, force: bool) -> None:
+    if context.source_dir == context.output_root:
+        return
+
+    for source_path in context.source_dir.iterdir():
+        if not source_path.is_file():
+            continue
+
+        destination_path = context.output_root / source_path.name
+        if destination_path.exists() and not force:
+            continue
+
+        shutil.copy2(source_path, destination_path)
+
+
+def prepared_dataset_exists(context: CompetitionContext) -> bool:
+    if not context.public_dir.is_dir() or is_empty(context.public_dir):
+        return False
+    if not context.private_dir.is_dir() or is_empty(context.private_dir):
+        return False
+    return all(path.is_file() for path in context.expected_output_files.values())
+
+
+def resolve_zip_path(
+    competition_id: str,
+    output_root: Path,
+    explicit_zip_file: Path | None,
+) -> Path | None:
+    if explicit_zip_file is not None:
+        zip_path = explicit_zip_file.expanduser().resolve()
+        if not zip_path.is_file():
+            raise FileNotFoundError(f"Zip file not found: `{zip_path}`")
+        return zip_path
+
+    preferred = (output_root / f"{competition_id}.zip").resolve()
+    if preferred.is_file():
+        return preferred
+
+    zip_files = sorted(path.resolve() for path in output_root.glob("*.zip") if path.is_file())
+    if len(zip_files) == 1:
+        return zip_files[0]
+    if len(zip_files) > 1:
+        raise ValueError(
+            f"Found multiple zip files under `{output_root}`. Pass `--zip-file` explicitly."
+        )
     return None
 
 
-def resolve_metadata_path(competition_id: str, filename: str) -> Path:
-    local_path = ROOT_DIR / competition_id / "prepared" / filename
-    if local_path.exists():
-        return local_path
-    source_dir = get_metadata_source_dir(competition_id)
-    if source_dir is not None:
-        return source_dir / filename
-    return local_path
+def need_to_accept_rules(error_message: str) -> bool:
+    return "You must accept this competition" in error_message
 
 
-def get_competition_paths(competition_id: str = DEFAULT_COMPETITION_ID) -> CompetitionPaths:
-    competition_dir = ROOT_DIR / competition_id
-    public_dir = competition_dir / "prepared" / "public"
-    private_dir = competition_dir / "prepared" / "private"
-    artifacts_dir = ROOT_DIR / "artifacts" / competition_id
-    submissions_dir = artifacts_dir / "submissions"
-    runs_dir = artifacts_dir / "runs"
-    return CompetitionPaths(
-        competition_id=competition_id,
-        competition_dir=competition_dir,
-        raw_dir=competition_dir / "raw",
-        public_dir=public_dir,
-        private_dir=private_dir,
-        train_path=public_dir / "train.csv",
-        public_test_path=public_dir / "test.csv",
-        sample_submission_path=public_dir / "sample_submission.csv",
-        gold_submission_path=private_dir / "gold_submission.csv",
-        private_test_path=private_dir / "test.csv",
-        description_path=resolve_metadata_path(competition_id, "description.md"),
-        leaderboard_path=resolve_metadata_path(competition_id, "leaderboard.csv"),
-        config_path=resolve_metadata_path(competition_id, "config.yaml"),
-        artifacts_dir=artifacts_dir,
-        submissions_dir=submissions_dir,
-        runs_dir=runs_dir,
-    )
-
-
-def initialize_results_tsv(results_path: Path = RESULTS_PATH) -> Path:
-    if not results_path.exists():
-        results_path.write_text(RESULTS_HEADER, encoding="utf-8")
-    return results_path
-
-
-def copy_metadata_files(paths: CompetitionPaths) -> None:
-    source_dir = get_metadata_source_dir(paths.competition_id)
-    if source_dir is None:
-        return
-    paths.prepared_dir.mkdir(parents=True, exist_ok=True)
-    for filename in METADATA_FILENAMES:
-        src = source_dir / filename
-        dst = paths.prepared_dir / filename
-        if src.exists() and not dst.exists():
-            shutil.copy2(src, dst)
-
-
-def find_first_file(root: Path, filename: str) -> Path:
-    direct = root / filename
-    if direct.exists():
-        return direct
-    matches = sorted(root.rglob(filename))
-    if not matches:
-        raise FileNotFoundError(f"Could not find `{filename}` under `{root}`.")
-    return matches[0]
-
-
-def extract_zip_to_raw(zip_path: Path, raw_dir: Path) -> None:
-    raw_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(raw_dir)
-
-
-def prepare_tabular_playground_may_2022(raw_dir: Path, public_dir: Path, private_dir: Path) -> None:
-    train_csv = find_first_file(raw_dir, "train.csv")
-    old_train = pd.read_csv(train_csv)
-    new_train, new_test = train_test_split(old_train, test_size=100_000, random_state=0)
-
-    new_train = new_train.reset_index(drop=True)
-    new_test = new_test.reset_index(drop=True)
-    new_train["id"] = np.arange(len(new_train))
-    new_test["id"] = np.arange(len(new_train), len(new_train) + len(new_test))
-
-    new_test_without_labels = new_test.drop(columns=["target"]).copy()
-    gold_submission = new_test[["id", "target"]].copy()
-    sample_submission = gold_submission.copy()
-    sample_submission["target"] = 0.5
-
-    public_dir.mkdir(parents=True, exist_ok=True)
-    private_dir.mkdir(parents=True, exist_ok=True)
-    new_train.to_csv(public_dir / "train.csv", index=False)
-    new_test_without_labels.to_csv(public_dir / "test.csv", index=False)
-    sample_submission.to_csv(public_dir / "sample_submission.csv", index=False)
-    new_test.to_csv(private_dir / "test.csv", index=False)
-    gold_submission.to_csv(private_dir / "gold_submission.csv", index=False)
-
-
-def is_prepared(paths: CompetitionPaths) -> bool:
-    for filename in REQUIRED_PUBLIC_FILES:
-        if not (paths.public_dir / filename).exists():
-            return False
-    for filename in REQUIRED_PRIVATE_FILES:
-        if not (paths.private_dir / filename).exists():
-            return False
-    return True
-
-
-def prepare_from_local_sources(paths: CompetitionPaths, force: bool = False) -> None:
-    if force and paths.prepared_dir.exists():
-        shutil.rmtree(paths.prepared_dir)
-
-    if is_prepared(paths):
-        copy_metadata_files(paths)
-        return
-
-    zip_candidates = sorted(paths.competition_dir.glob("*.zip"))
-    if not paths.raw_dir.exists() or not any(paths.raw_dir.iterdir()):
-        if not zip_candidates:
-            raise FileNotFoundError(
-                f"No prepared dataset found for `{paths.competition_id}` and no local zip file is available. "
-                f"Expected either `{paths.prepared_dir}` or a zip inside `{paths.competition_dir}`."
-            )
-        extract_zip_to_raw(zip_candidates[0], paths.raw_dir)
-
-    if paths.competition_id not in SUPPORTED_RAW_PREPARERS:
-        raise NotImplementedError(
-            f"Automatic raw->prepared conversion is only implemented for {sorted(SUPPORTED_RAW_PREPARERS)}. "
-            f"For `{paths.competition_id}`, place an mle-bench style prepared dataset under `{paths.prepared_dir}` first."
+def prompt_user_to_accept_rules(competition_id: str) -> None:
+    response = input("Open the Kaggle competition rules page now? [y/N]: ").strip().lower()
+    if response != "y":
+        raise RuntimeError(
+            "Kaggle competition rules must be accepted before the dataset can be downloaded."
         )
 
-    prepare_tabular_playground_may_2022(paths.raw_dir, paths.public_dir, paths.private_dir)
-    copy_metadata_files(paths)
+    webbrowser.open(f"https://www.kaggle.com/c/{competition_id}/rules")
+    input("Press Enter after you have accepted the rules...")
 
 
-def prepare_for_auroc_metric(
-    submission: pd.DataFrame,
-    answers: pd.DataFrame,
-    id_col: str = "id",
-    target_col: str = "target",
-) -> dict[str, np.ndarray]:
-    if id_col not in answers.columns or target_col not in answers.columns:
-        raise InvalidSubmissionError(f"Answers must contain `{id_col}` and `{target_col}` columns.")
-    if id_col not in submission.columns or target_col not in submission.columns:
-        raise InvalidSubmissionError(f"Submission must contain `{id_col}` and `{target_col}` columns.")
-    if len(submission) != len(answers):
-        raise InvalidSubmissionError("Submission and answers must have the same number of rows.")
+def download_competition_zip(context: CompetitionContext) -> Path:
+    logger.info(
+        "Downloading `%s` into `%s`...",
+        context.competition_id,
+        context.output_root,
+    )
 
-    y_score = pd.to_numeric(submission[target_col], errors="coerce")
-    if y_score.isna().any():
-        raise InvalidSubmissionError("Submission target column must be numeric.")
-    if (y_score < 0).any() or (y_score > 1).any():
-        raise InvalidSubmissionError("Submission target column must contain probabilities in [0, 1].")
+    api = authenticate_kaggle_api()
 
-    submission_sorted = submission.sort_values(id_col).reset_index(drop=True)
-    answers_sorted = answers.sort_values(id_col).reset_index(drop=True)
-    if not submission_sorted[id_col].equals(answers_sorted[id_col]):
-        raise InvalidSubmissionError(f"Submission and answers must contain the same `{id_col}` values.")
+    # Import lazily so Kaggle credentials are not requested at module import time.
+    from kaggle.rest import ApiException
 
+    try:
+        api.competition_download_files(
+            competition=context.competition_id,
+            path=context.output_root,
+            quiet=False,
+            force=False,
+        )
+    except ApiException as exc:
+        if not need_to_accept_rules(str(exc)):
+            raise
+        logger.warning("Competition rules must be accepted before downloading.")
+        prompt_user_to_accept_rules(context.competition_id)
+        return download_competition_zip(context)
+
+    zip_path = resolve_zip_path(context.competition_id, context.output_root, explicit_zip_file=None)
+    if zip_path is None:
+        raise FileNotFoundError(
+            f"Expected a downloaded zip under `{context.output_root}`, but none was found."
+        )
+    return zip_path
+
+
+def ensure_raw_data(
+    context: CompetitionContext,
+    explicit_zip_file: Path | None,
+    skip_download: bool,
+) -> Path | None:
+    if context.raw_dir.is_dir() and not is_empty(context.raw_dir):
+        logger.info("Reusing existing raw data in `%s`.", context.raw_dir)
+        return None
+
+    zip_path = resolve_zip_path(
+        context.competition_id,
+        context.output_root,
+        explicit_zip_file=explicit_zip_file,
+    )
+    if zip_path is None and skip_download:
+        raise FileNotFoundError(
+            "No raw data or zip file is available, and `--skip-download` was set."
+        )
+    if zip_path is None:
+        zip_path = download_competition_zip(context)
+
+    logger.info("Extracting `%s` to `%s`...", zip_path, context.raw_dir)
+    extract(zip_path, context.raw_dir, recursive=False)
+    return zip_path
+
+
+def copy_description(context: CompetitionContext) -> None:
+    description_output = context.public_dir / "description.md"
+    description_output.write_text(context.description_source.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def validate_grading_ready(context: CompetitionContext) -> None:
+    if not context.answers_path.is_file():
+        raise FileNotFoundError(
+            f"Answers file not found for `{context.competition_id}`: `{context.answers_path}`"
+        )
+
+
+def get_rank_info(context: CompetitionContext, score: float | None) -> dict[str, Any]:
+    if not context.leaderboard_path.is_file():
+        return {
+            "gold_medal": False,
+            "silver_medal": False,
+            "bronze_medal": False,
+            "above_median": False,
+            "gold_threshold": None,
+            "silver_threshold": None,
+            "bronze_threshold": None,
+            "median_threshold": None,
+            "is_lower_better": None,
+        }
+
+    leaderboard = read_csv(context.leaderboard_path)
+    rank_info = context.grader.rank_score(score, leaderboard)
     return {
-        "y_true": answers_sorted[target_col].to_numpy(),
-        "y_score": submission_sorted[target_col].to_numpy(dtype=float),
+        **rank_info,
+        "is_lower_better": context.grader.is_lower_better(leaderboard),
     }
 
 
-def grade_submission(submission: pd.DataFrame, answers: pd.DataFrame) -> float:
-    metric_inputs = prepare_for_auroc_metric(submission, answers)
-    return float(roc_auc_score(metric_inputs["y_true"], metric_inputs["y_score"]))
-
-
-def load_gold_answers(paths: CompetitionPaths) -> pd.DataFrame:
-    return pd.read_csv(paths.gold_submission_path)
-
-
-def read_public_data(paths: CompetitionPaths) -> tuple[pd.DataFrame, pd.DataFrame]:
-    train_df = pd.read_csv(paths.train_path)
-    test_df = pd.read_csv(paths.public_test_path)
-    return train_df, test_df
-
-
-def score_submission(submission: pd.DataFrame, paths: CompetitionPaths) -> ScoreReport:
-    score = grade_submission(submission, load_gold_answers(paths))
-    return compare_to_leaderboard(score, paths.leaderboard_path)
-
-
-def compare_to_leaderboard(score: float, leaderboard_path: Path) -> ScoreReport:
-    if not leaderboard_path.exists():
-        return ScoreReport(
-            score=score,
-            medal="unavailable",
-            above_median=None,
-            estimated_rank=None,
-            total_teams=None,
-            gold_threshold=None,
-            silver_threshold=None,
-            bronze_threshold=None,
-            median_threshold=None,
-            lower_is_better=None,
+def validate_outputs(context: CompetitionContext) -> None:
+    if not context.public_dir.is_dir() or is_empty(context.public_dir):
+        raise RuntimeError(f"Prepared public directory is missing or empty: `{context.public_dir}`")
+    if not context.private_dir.is_dir() or is_empty(context.private_dir):
+        raise RuntimeError(
+            f"Prepared private directory is missing or empty: `{context.private_dir}`"
         )
 
-    leaderboard = pd.read_csv(leaderboard_path)
-    if "score" not in leaderboard.columns or leaderboard.empty:
-        return ScoreReport(
-            score=score,
-            medal="unavailable",
-            above_median=None,
-            estimated_rank=None,
-            total_teams=None,
-            gold_threshold=None,
-            silver_threshold=None,
-            bronze_threshold=None,
-            median_threshold=None,
-            lower_is_better=None,
-        )
-
-    scores = leaderboard["score"].astype(float).reset_index(drop=True)
-    lower_is_better = bool(scores.iloc[0] < scores.iloc[-1])
-    num_teams = len(scores)
-
-    def score_at_position(position: int) -> float:
-        idx = min(max(position, 1), num_teams) - 1
-        return float(scores.iloc[idx])
-
-    if 1 <= num_teams < 100:
-        gold_threshold = score_at_position(max(1, int(num_teams * 0.1)))
-        silver_threshold = score_at_position(max(1, int(num_teams * 0.2)))
-        bronze_threshold = score_at_position(max(1, int(num_teams * 0.4)))
-    elif 100 <= num_teams < 250:
-        gold_threshold = score_at_position(10)
-        silver_threshold = score_at_position(max(1, int(num_teams * 0.2)))
-        bronze_threshold = score_at_position(max(1, int(num_teams * 0.4)))
-    elif 250 <= num_teams < 1000:
-        gold_threshold = score_at_position(10 + int(num_teams * 0.002))
-        silver_threshold = score_at_position(50)
-        bronze_threshold = score_at_position(100)
-    else:
-        gold_threshold = score_at_position(10 + int(num_teams * 0.002))
-        silver_threshold = score_at_position(max(1, int(num_teams * 0.05)))
-        bronze_threshold = score_at_position(max(1, int(num_teams * 0.1)))
-
-    median_threshold = float(scores.median())
-
-    def meets(threshold: float) -> bool:
-        return score <= threshold if lower_is_better else score >= threshold
-
-    gold_medal = meets(gold_threshold)
-    silver_medal = not gold_medal and meets(silver_threshold)
-    bronze_medal = not gold_medal and not silver_medal and meets(bronze_threshold)
-    medal = "gold" if gold_medal else "silver" if silver_medal else "bronze" if bronze_medal else "none"
-    above_median = score < median_threshold if lower_is_better else score > median_threshold
-
-    if lower_is_better:
-        estimated_rank = int((scores < score).sum() + 1)
-    else:
-        estimated_rank = int((scores > score).sum() + 1)
-
-    return ScoreReport(
-        score=score,
-        medal=medal,
-        above_median=bool(above_median),
-        estimated_rank=estimated_rank,
-        total_teams=num_teams,
-        gold_threshold=gold_threshold,
-        silver_threshold=silver_threshold,
-        bronze_threshold=bronze_threshold,
-        median_threshold=median_threshold,
-        lower_is_better=lower_is_better,
-    )
-
-
-def build_dataset_summary(paths: CompetitionPaths) -> DatasetSummary:
-    train_df = pd.read_csv(paths.train_path)
-    public_test_df = pd.read_csv(paths.public_test_path)
-    gold_df = pd.read_csv(paths.gold_submission_path)
-    return DatasetSummary(
-        competition_id=paths.competition_id,
-        train_rows=len(train_df),
-        public_test_rows=len(public_test_df),
-        private_rows=len(gold_df),
-        num_features=len(train_df.columns) - 2,
-        target_mean=float(train_df["target"].mean()),
-        description_path=str(paths.description_path) if paths.description_path.exists() else "",
-        leaderboard_path=str(paths.leaderboard_path) if paths.leaderboard_path.exists() else None,
-    )
-
-
-def validate_prepared_dataset(paths: CompetitionPaths) -> DatasetSummary:
-    missing = []
-    for filename in REQUIRED_PUBLIC_FILES:
-        path = paths.public_dir / filename
-        if not path.exists():
-            missing.append(str(path))
-    for filename in REQUIRED_PRIVATE_FILES:
-        path = paths.private_dir / filename
-        if not path.exists():
-            missing.append(str(path))
+    missing = {
+        key: path
+        for key, path in context.expected_output_files.items()
+        if not path.is_file()
+    }
     if missing:
-        raise FileNotFoundError("Missing required prepared files:\n" + "\n".join(missing))
-
-    train_df = pd.read_csv(paths.train_path)
-    public_test_df = pd.read_csv(paths.public_test_path)
-    sample_df = pd.read_csv(paths.sample_submission_path)
-    gold_df = pd.read_csv(paths.gold_submission_path)
-
-    if "target" not in train_df.columns:
-        raise ValueError("Expected `target` column in prepared public train.csv.")
-    if "target" in public_test_df.columns:
-        raise ValueError("Public test.csv should not contain the target column.")
-    if list(sample_df.columns) != ["id", "target"]:
-        raise ValueError("sample_submission.csv must have columns [id, target].")
-    if list(gold_df.columns) != ["id", "target"]:
-        raise ValueError("gold_submission.csv must have columns [id, target].")
-    if len(public_test_df) != len(sample_df) or len(sample_df) != len(gold_df):
-        raise ValueError("Public test, sample submission, and gold submission must have identical row counts.")
-    if not sample_df["id"].equals(gold_df["id"]):
-        raise ValueError("sample_submission ids must match gold_submission ids exactly.")
-
-    if paths.private_test_path.exists():
-        private_test_df = pd.read_csv(paths.private_test_path)
-        if len(private_test_df) != len(gold_df):
-            raise ValueError("Private labeled test.csv must align with gold_submission.csv.")
-        if "target" not in private_test_df.columns:
-            raise ValueError("Private test.csv should retain labels for offline grading.")
-
-    return build_dataset_summary(paths)
+        expected = ", ".join(f"{key} -> {path}" for key, path in missing.items())
+        raise RuntimeError(f"Preparation finished but required files are missing: {expected}")
 
 
-def write_context_file(paths: CompetitionPaths, summary: DatasetSummary) -> Path:
-    paths.artifacts_dir.mkdir(parents=True, exist_ok=True)
-    context = {
-        "competition_id": paths.competition_id,
-        "time_budget_seconds": TIME_BUDGET_SECONDS,
-        "results_path": str(initialize_results_tsv()),
-        "summary": asdict(summary),
-    }
-    if paths.description_path.exists():
-        context["description_excerpt"] = paths.description_path.read_text(encoding="utf-8")[:2000]
-    context_path = paths.artifacts_dir / "competition_context.json"
-    context_path.write_text(json.dumps(context, indent=2), encoding="utf-8")
-    return context_path
+def prepare_competition(
+    context: CompetitionContext,
+    explicit_zip_file: Path | None,
+    skip_download: bool,
+    keep_raw: bool,
+    force: bool,
+) -> None:
+    ensure_dirs(context)
+    sync_competition_metadata(context, force=force)
+
+    if prepared_dataset_exists(context) and not force:
+        logger.info(
+            "Prepared dataset already exists at `%s`. Use `--force` to rebuild it.",
+            context.output_root / "prepared",
+        )
+        return
+
+    if force and (context.output_root / "prepared").exists():
+        logger.info("Removing existing prepared data under `%s`...", context.output_root / "prepared")
+        shutil.rmtree(context.output_root / "prepared")
+        ensure_dirs(context)
+
+    ensure_raw_data(
+        context=context,
+        explicit_zip_file=explicit_zip_file,
+        skip_download=skip_download,
+    )
+
+    logger.info(
+        "Running `%s` from `%s`...",
+        context.prepare_fn.__name__,
+        context.prepare_fn.__module__,
+    )
+    context.prepare_fn(
+        raw=context.raw_dir,
+        public=context.public_dir,
+        private=context.private_dir,
+    )
+
+    copy_description(context)
+    validate_outputs(context)
+
+    if not keep_raw and context.raw_dir.exists():
+        logger.info("Removing raw data under `%s`...", context.raw_dir)
+        shutil.rmtree(context.raw_dir)
 
 
-def ensure_prepared_competition(
-    competition_id: str = DEFAULT_COMPETITION_ID,
+def prepare_dataset(
+    competition_name: str,
+    path: str | Path | None = None,
+    zip_file: str | Path | None = None,
+    skip_download: bool = False,
+    keep_raw: bool = False,
     force: bool = False,
-) -> CompetitionPaths:
-    paths = get_competition_paths(competition_id)
-    prepare_from_local_sources(paths, force=force)
-    summary = validate_prepared_dataset(paths)
-    initialize_results_tsv()
-    write_context_file(paths, summary)
-    paths.submissions_dir.mkdir(parents=True, exist_ok=True)
-    paths.runs_dir.mkdir(parents=True, exist_ok=True)
-    return paths
+) -> CompetitionContext:
+    """Prepare one competition dataset and return its resolved local context."""
+
+    explicit_zip_file = None
+    if zip_file is not None:
+        explicit_zip_file = Path(zip_file).expanduser().resolve()
+
+    context = build_context(competition_name, resolve_output_root(competition_name, path))
+    prepare_competition(
+        context=context,
+        explicit_zip_file=explicit_zip_file,
+        skip_download=skip_download,
+        keep_raw=keep_raw,
+        force=force,
+    )
+    return context
+
+
+def grade_submission_with_context(
+    submission_path: str | Path,
+    context: CompetitionContext,
+) -> GradeResult:
+    validate_grading_ready(context)
+
+    submission_path = Path(submission_path).expanduser().resolve()
+    submission_exists = submission_path.is_file() and submission_path.suffix.lower() == ".csv"
+
+    score = None
+    valid_submission = False
+    error_message = None
+
+    if submission_exists:
+        try:
+            submission_df = read_csv(submission_path)
+            answers = load_answers(context.answers_path)
+            score = round(float(context.grader.grade_fn(submission_df, answers)), 5)
+            valid_submission = True
+        except InvalidSubmissionError as exc:
+            error_message = str(exc)
+            logger.warning("Invalid submission for `%s`: %s", context.competition_id, exc)
+        except Exception as exc:
+            error_message = f"Unexpected error during grading: {exc}"
+            logger.exception("Unexpected grading error for `%s`.", context.competition_id)
+    else:
+        error_message = f"Submission file not found or not a CSV: `{submission_path}`"
+
+    rank_info = get_rank_info(context, score)
+
+    return GradeResult(
+        competition_id=context.competition_id,
+        metric_name=context.grader.name,
+        score=score,
+        submission_path=str(submission_path),
+        submission_exists=submission_exists,
+        valid_submission=valid_submission,
+        error_message=error_message,
+        is_lower_better=rank_info["is_lower_better"],
+        gold_threshold=rank_info["gold_threshold"],
+        silver_threshold=rank_info["silver_threshold"],
+        bronze_threshold=rank_info["bronze_threshold"],
+        median_threshold=rank_info["median_threshold"],
+        any_medal=bool(
+            rank_info["gold_medal"] or rank_info["silver_medal"] or rank_info["bronze_medal"]
+        ),
+        gold_medal=bool(rank_info["gold_medal"]),
+        silver_medal=bool(rank_info["silver_medal"]),
+        bronze_medal=bool(rank_info["bronze_medal"]),
+        above_median=bool(rank_info["above_median"]),
+        answers_path=str(context.answers_path),
+        leaderboard_path=str(context.leaderboard_path) if context.leaderboard_path.is_file() else None,
+        created_at=datetime.now().isoformat(),
+    )
+
+
+def grade_submission(
+    submission_path: str | Path,
+    competition_name: str,
+    path: str | Path | None = None,
+) -> GradeResult:
+    """Grade a submission CSV against the prepared hidden labels for one competition."""
+
+    context = build_context(competition_name, resolve_output_root(competition_name, path))
+    return grade_submission_with_context(submission_path, context)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare an mle-bench style competition for AutoML autoresearch.")
-    parser.add_argument("--competition-id", default=DEFAULT_COMPETITION_ID, help="Competition id / local folder name.")
-    parser.add_argument("--force", action="store_true", help="Rebuild the local prepared directory from raw/zip when possible.")
-    args = parser.parse_args()
+    args = parse_args()
 
-    paths = ensure_prepared_competition(args.competition_id, force=args.force)
-    summary = build_dataset_summary(paths)
-    leaderboard = compare_to_leaderboard(summary.target_mean, paths.leaderboard_path)
+    context = prepare_dataset(
+        competition_name=args.competition_name,
+        path=args.path,
+        zip_file=args.zip_file,
+        skip_download=args.skip_download,
+        keep_raw=args.keep_raw,
+        force=args.force,
+    )
 
-    print(f"Competition:      {summary.competition_id}")
-    print(f"Prepared dir:     {paths.prepared_dir}")
-    print(f"Train rows:       {summary.train_rows:,}")
-    print(f"Public test rows: {summary.public_test_rows:,}")
-    print(f"Private rows:     {summary.private_rows:,}")
-    print(f"Num features:     {summary.num_features}")
-    print(f"Target mean:      {summary.target_mean:.6f}")
-    if paths.description_path.exists():
-        print(f"Description:      {paths.description_path}")
-    if paths.leaderboard_path.exists():
-        print(f"Leaderboard:      {paths.leaderboard_path}")
-        print(f"Median score:     {leaderboard.median_threshold:.5f}")
-        print(f"Gold threshold:   {leaderboard.gold_threshold:.5f}")
-    print(f"Results TSV:      {initialize_results_tsv()}")
-    print(f"Time budget:      {TIME_BUDGET_SECONDS}s")
-    print()
-    print("Ready. Use `python train.py` for experiments.")
+    logger.info("Preparation finished.")
+    logger.info("Output root: %s", context.output_root)
+    logger.info("Public split: %s", context.public_dir)
+    logger.info("Private split: %s", context.private_dir)
+
+    if args.submission is not None:
+        grade_result = grade_submission_with_context(args.submission, context)
+        logger.info("Grading finished.")
+        logger.info(json.dumps(grade_result.to_dict(), indent=2))
 
 
 if __name__ == "__main__":
